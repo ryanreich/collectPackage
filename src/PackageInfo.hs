@@ -1,6 +1,18 @@
-{- 
-- Copied wholesale from
-- https://github.com/ghc/ghc/blob/master/utils/ghc-pkg/Main.hs#L1226-L1308
+{- |
+Module: PackageInfo
+Description: Package info format converter
+Copyright: (c) Ryan Reich, 2018-2019
+License: MIT
+Maintainer: ryan.reich@gmail.com
+Stability: experimental
+
+Copied wholesale from
+https://github.com/ghc/ghc/blob/master/utils/ghc-pkg/Main.hs#L1226-L1308
+
+Honestly, 'convertPackageInfoToCacheFormat' ought to be part of
+"GHC.PackageDb", since it requires this format and even mentions how it
+differs from the one Cabal uses.
+
 -}
 module PackageInfo where
 
@@ -21,6 +33,9 @@ import Distribution.Version
 import qualified GHC.PackageDb as GhcPkg
 import GHC.PackageDb (BinaryStringRep(..))
 
+-- | Since the 'InstalledPackageInfo' is polymorphic, this is the
+-- instantiation that corresponds to the package cache, as described in
+-- "GHC.PackageDb"
 type PackageCacheFormat = GhcPkg.InstalledPackageInfo
   ComponentId
   PackageIdentifier
@@ -30,6 +45,7 @@ type PackageCacheFormat = GhcPkg.InstalledPackageInfo
   ModuleName
   OpenModule
 
+-- | Converts a Cabal-style package info into a @ghc-pkg@-style one
 convertPackageInfoToCacheFormat :: InstalledPackageInfo -> PackageCacheFormat
 convertPackageInfoToCacheFormat pkg =
     GhcPkg.InstalledPackageInfo {

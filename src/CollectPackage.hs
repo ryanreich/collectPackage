@@ -1,4 +1,37 @@
 {-# LANGUAGE TemplateHaskell #-}
+{- |
+Module: CollectPackage
+Description: Tool for getting Haskell linking data for a library in a Stack project
+Copyright: (c) Ryan Reich, 2018-2019
+License: MIT
+Maintainer: ryan.reich@gmail.com
+Stability: experimental
+
+This tool interprets the Cabal project data, as handled by Stack, in order
+to copy (hard link) the required interface files and dynamic libraries for
+linking with the library component defined in the project.  This is
+different from the easier problem of collecting the dynamic linking
+dependencies of an executable, which can be done using standard Linux tools
+(@ldd@ and @awk@, primarily), and is a useful part of building a minimal
+Docker image around a project that uses the @hint@ package, or the GHC API
+in general, which of course requires this linking information to load
+modules.  It is quite pointless for installing a project directly onto the
+local system, however, since GHC is already present there (if not, this
+tool will not work).
+
+When run, the tool takes no arguments, attempts to find the library defined
+in a Stack-based cabal project above the current directory, and places the
+duplicated interfaces and dynamic libraries into an appropriate structure
+in the current directory.  It actually has to be run via @stack exec@,
+because it needs the environment stack provides, in particular the
+@HASKELL_DIST_DIR@.
+
+This probably only works in Linux right now.
+
+-}
+
+module CollectPackage where
+
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.Zip
@@ -34,6 +67,7 @@ import System.Posix.Files
 
 import Text.Read
 
+-- | Ad-hoc static data collected before starting the main routine
 data Info =
   Info
   {
@@ -41,24 +75,29 @@ data Info =
     ghcVersion :: String
   }
 
+-- | Shorthand.  It has to build on 'IO' because we do serious filesystem
+-- operations pretty much everywhere.
 type InfoM = ReaderT Info IO
 
 makeLenses ''InstalledPackageInfo
 makeLenses ''Info
 
+-- | For the executable
 main :: IO ()
 main = do
   newRoot <- getCurrentDirectory
-  projectRoot <- getProjectRoot newRoot
-  createDirectoryIfMissing True (libSubdir newRoot)
   createDirectoryIfMissing True (libSubdir newRoot)
   createDirectoryIfMissing True (packageDBSubdir newRoot)
-  (ghcVersion, packageInfo, packageIndex) <- getBuildInfo projectRoot
+  (ghcVersion, packageInfo, packageIndex) <- getBuildInfo =<< getProjectRoot newRoot
   let packageInfos = packageInfo : allPackages packageIndex
   flip runReaderT Info{..} $ do
     forM_ packageInfos copyPackage
     createPackageDB packageInfos
 
+-- | Makes a GHC package cache from the given packages.  This is not
+-- necessary just for dynamic linking, but is necessary if you are going to
+-- use the @hint@ package (or the GHC API in general) as an embedded
+-- interpreter that needs to find packages at runtime.
 createPackageDB :: [InstalledPackageInfo] -> InfoM ()
 createPackageDB packageInfos = do
   Info{..} <- ask
@@ -70,21 +109,27 @@ createPackageDB packageInfos = do
     writePackageDb cacheFilename ghcPackageInfos newPackageInfos
     unlockPackageDb lock
 
+-- | Copies both the interface files and the dynamic libraries
 copyPackage :: InstalledPackageInfo -> InfoM ()
-copyPackage packageInfo@InstalledPackageInfo{installedUnitId} = do
-  Info{..} <- ask
+copyPackage packageInfo = do
   copyLibraryDirs packageInfo
   copyDynLibs packageInfo
  
+-- | Copies the (dynamic only) interface files, as reported by the package info.
 copyLibraryDirs :: InstalledPackageInfo -> InfoM ()
 copyLibraryDirs InstalledPackageInfo{libraryDirs, importDirs} = do
   Info{..} <- ask
   liftIO $ forM_ (libraryDirs `union` importDirs) $ \libDir -> do
     let newDir = replaceDirectory libDir (libSubdir newRoot)
+        cond file = takeExtension file == ".dyn_hi" 
     alreadyCopied <- doesDirectoryExist newDir
-    let cond file = takeExtension file == ".dyn_hi" 
     unless alreadyCopied $ fastCopyDir cond newDir libDir
 
+-- | Copies all the dynamic libraries, as reported by the package info.
+-- This deals with a few alternatives for possible names, which may include
+-- the GHC version (or not; it depends if the package is part of GHC) and
+-- may actually be a C library, in which case the binary name does not
+-- quite match the library "name".
 copyDynLibs :: InstalledPackageInfo -> InfoM ()
 copyDynLibs InstalledPackageInfo{libraryDirs,libraryDynDirs,hsLibraries} = do
   Info{..} <- ask
@@ -110,6 +155,9 @@ copyDynLibs InstalledPackageInfo{libraryDirs,libraryDynDirs,hsLibraries} = do
     nonCLibraries = nub $ removeC <$> hsLibraries
     removeC x = fromMaybe x (stripPrefix "C" x)
 
+-- | The copy is fast because it just hard-links files, so this can't be
+-- done cross-device.  The first argument, @cond@, is a predicate
+-- determining whether a file in the old directory is to be linked or not.
 fastCopyDir :: (FilePath -> Bool) -> FilePath -> FilePath -> IO ()
 fastCopyDir cond newDir oldDir = do
   createDirectory newDir
@@ -122,6 +170,9 @@ fastCopyDir cond newDir oldDir = do
     then fastCopyDir cond newFilePath oldFilePath
     else when (cond file) $ createLink oldFilePath newFilePath
 
+-- | Looks into the @distdir@, wherever Stack put it, as indicated by the
+-- @HASKELL_DIST_DIR@ envvar.  This is the starting point for the entire
+-- adventure: all the package and compiler info is found here.
 getBuildInfo :: 
   FilePath -> IO (String, InstalledPackageInfo, InstalledPackageIndex)
 getBuildInfo projectRoot = do
@@ -133,6 +184,7 @@ getBuildInfo projectRoot = do
       ghcVersion = display flavor ++ display version
   return (ghcVersion, packageInfo, installedPkgs)
 
+-- | Finds the library component of the project from the build info
 getLibComponent :: LocalBuildInfo -> IO InstalledPackageInfo
 getLibComponent LocalBuildInfo{componentNameMap, withPackageDB} = do
   case Map.lookup CLibName componentNameMap of
@@ -152,6 +204,8 @@ getLibComponent LocalBuildInfo{componentNameMap, withPackageDB} = do
     pkgdbPath (SpecificPackageDB path) = path
     pkgdbPath _ = error "Registration db isn't the project's"
 
+-- | Mimics, hopefully, the ascending recursive process that @stack@ itself
+-- uses to find the project root.
 getProjectRoot :: FilePath -> IO FilePath
 getProjectRoot [pathSeparator] = error "No stack project found"
 getProjectRoot dir = do
@@ -160,12 +214,17 @@ getProjectRoot dir = do
   then return dir
   else getProjectRoot (takeDirectory dir)
 
+-- | Scans through a list of files until a lookup finally succeeds on one
+-- of them.
 sequencePath :: (Monad m) => [FilePath] -> (FilePath -> m (Maybe a)) -> m (Maybe a)
 sequencePath paths f = go paths Nothing where
   go [] Nothing = return Nothing
   go _ (Just x) = return $ Just x
   go (path : rest) Nothing = f path >>= go rest
 
+-- | Adjusts certain important fields of the package info to reflect its
+-- new location.  The package info file hard-codes various paths that, of
+-- course, need to be changed when the package is copied to a new place.
 moveRoot :: InstalledPackageInfo -> InstalledPackageInfo
 moveRoot pkgInfo = pkgInfo
   & _importDirs %~ map chroot
@@ -179,16 +238,21 @@ moveRoot pkgInfo = pkgInfo
     libDir = libSubdir root
     root = [pathSeparator]
 
+-- | Since we don't do anything with the Haddocks, the relevant fields are
+-- voided.
 minimalize :: InstalledPackageInfo -> InstalledPackageInfo
 minimalize pkgInfo = pkgInfo
   & _haddockInterfaces .~ []
   & _haddockHTMLs .~ []
 
+-- | Universal convention for naming a library directory
 libSubdir :: FilePath -> FilePath
 libSubdir = (</> "lib")
 
+-- | Universal convention for placing the package database
 packageDBSubdir :: FilePath -> FilePath
 packageDBSubdir = (</> "ghc-pkgdb") . libSubdir
 
+-- | Universal convention for adding the library file extension
 addSO :: FilePath -> FilePath
 addSO = (<.> "so")

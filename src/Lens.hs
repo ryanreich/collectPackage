@@ -1,7 +1,7 @@
 {- |
 Module: Lens
 Description: Wrapper library for "Control.Lens"
-Copyright: (c) Ryan Reich, 2017-2018
+Copyright: (c) Ryan Reich, 2017-2019
 License: MIT
 Maintainer: ryan.reich@gmail.com
 Stability: experimental
